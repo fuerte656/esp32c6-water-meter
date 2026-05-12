@@ -1,0 +1,41 @@
+# =================================================================
+# Battery / End Device overrides
+# =================================================================
+#
+# Use together with sdkconfig.defaults:
+#
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.battery" build
+#
+# Always also flip the matching flags in wm_config.h:
+#   #define WM_POWER_USB     0
+#   #define WM_DEEP_SLEEP    0   (or 1 for deep sleep)
+# =================================================================
+
+# Switch Zigbee role from Router/Coordinator to End Device
+# CONFIG_ZB_ZCZR is not set
+CONFIG_ZB_ZED=y
+
+# Enable power management & tickless idle so the chip can light-sleep
+# while idle even outside deep sleep. This dramatically reduces draw
+# during the always-on End Device mode and also helps deep sleep wake
+# more cleanly. Safe to leave on for both modes.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# Lower the CPU clock for active periods - cuts power ~30%, plenty
+# fast enough for our workload.
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=80
+
+# NOTE: removed CONFIG_MAC_BB_PD / CONFIG_ESP_PHY_MAC_BB_PD here.
+# In IDF v5.5.4 those Kconfig symbols cause esp_phy/phy_init_data.c
+# to include esp_private/sleep_retention.h, which is provided by
+# esp_hw_support but not added to esp_phy's PRIV_REQUIRES, so the
+# build fails. Skipping these options costs a small amount of standby
+# current in always-on ED mode and nothing at all in deep-sleep mode.
+
+# Smaller main task stack OK for ED (less Zigbee traffic).
+# Keep at 4096 to be safe with deep-sleep init code.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
