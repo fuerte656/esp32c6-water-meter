@@ -50,6 +50,11 @@ static void supervisor_task(void *arg)
         last_save_us[i] = now_us0;
     }
 
+    /* Force a report on every meter (and battery, if enabled) every
+     * WM_KEEPALIVE_PERIOD_S, so HA sees regular traffic even with no
+     * water flow. */
+    int64_t last_keepalive_us = now_us0;
+
 #if WM_BATTERY_MONITORING
     int64_t  last_batt_us  = 0;
 #endif
@@ -94,6 +99,27 @@ static void supervisor_task(void *arg)
             last_batt_us = now_us;
         }
 #endif
+
+        /* Hourly keepalive: re-push every meter (and battery) even if
+         * nothing changed, so HA's availability tracker stays happy. */
+        if ((now_us - last_keepalive_us) >=
+            (int64_t)WM_KEEPALIVE_PERIOD_S * 1000000LL) {
+            for (int i = 0; i < WM_NUM_METERS; i++) {
+                uint64_t total_x1000 =
+                    pulse_counter_get_total_liters_x1000(i);
+                zb_metering_update_total(i, total_x1000);
+                last_pushed[i] = total_x1000;
+                ESP_LOGI(TAG, "keepalive: meter[%d] = %llu L (x1000)",
+                         i, (unsigned long long)total_x1000);
+            }
+#if WM_BATTERY_MONITORING
+            uint32_t mv  = battery_read_mv();
+            uint8_t  pct = battery_read_percent();
+            zb_metering_update_battery(pct, mv);
+            last_batt_us = now_us;
+#endif
+            last_keepalive_us = now_us;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

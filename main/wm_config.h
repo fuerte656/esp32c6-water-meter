@@ -62,10 +62,13 @@
  */
 #define WM_BATTERY_MONITORING    0
 
-/* Keepalive period for deep-sleep mode: how often to wake up and
- * send a report even if no pulses arrived. Lets HA detect that the
- * device is alive. */
-#define WM_KEEPALIVE_PERIOD_S    900     /* 15 minutes */
+/* Keepalive period.
+ *   - Always-on modes: the supervisor task forces a Zigbee report on
+ *     every meter (and battery, if monitored) at this cadence even
+ *     when nothing changed, so HA's availability tracker stays happy.
+ *   - Deep-sleep mode: the chip also wakes from sleep on this timer
+ *     to send the same heartbeat reports. */
+#define WM_KEEPALIVE_PERIOD_S    3600    /* 1 hour */
 
 /* =================================================================
  * Pulse counting

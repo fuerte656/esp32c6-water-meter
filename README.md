@@ -73,7 +73,7 @@ idf.py -p COM4 flash monitor
 ```
 
 Behavior: chip sleeps in deep sleep until a pulse on GPIO 2 / GPIO 5
-OR every WM_KEEPALIVE_PERIOD_S (default 15 min). On wake, joins
+OR every WM_KEEPALIVE_PERIOD_S (default 1 hour). On wake, joins
 parent, sends reports for both meters, sleeps. ~50 uA average.
 Estimated **~5 years** on a single LS14500 (LiSOCl2 AA, ~2.6 Ah) +
 HPC1550 hybrid capacitor; the HPC supplies the Zigbee TX bursts the
@@ -147,6 +147,11 @@ IEEE address). HA discovery republishes automatically.
   sources. On wake, each line is sampled - whichever is still closed
   is credited with one pulse. If both fire simultaneously, both get
   credited.
+- The supervisor forces a Zigbee report on every meter (and the
+  battery, if monitored) every `WM_KEEPALIVE_PERIOD_S` (1 hour by
+  default), so Home Assistant's availability tracker stays happy
+  even on dry days. In deep-sleep mode the chip wakes on the same
+  timer to do the same thing.
 - Don't reduce WM_KEEPALIVE_PERIOD_S below ~5 min - it just burns
   battery for negligible benefit (HA already knows the device exists
   via the last seMetering report).
