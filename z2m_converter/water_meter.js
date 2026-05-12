@@ -51,9 +51,9 @@ const tzWaterRead = {
 
 const definition = {
     fingerprint: [
-        { modelID: 'esp32c6', manufacturerName: 'ESPRESSIF' },
+        { modelID: 'ESP32C6.WaterMeter', manufacturerName: 'DIY' },
     ],
-    zigbeeModel: ['esp32c6', 'ESP32C6.WaterMeter'],
+    zigbeeModel: ['ESP32C6.WaterMeter'],
     model: 'ESP32C6_WATER',
     vendor: 'DIY',
     description: 'ESP32-C6 Zigbee impulse water meter (dual)',
