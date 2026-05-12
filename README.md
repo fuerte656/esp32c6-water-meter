@@ -79,11 +79,53 @@ Estimated **~5 years** on a single LS14500 (LiSOCl2 AA, ~2.6 Ah) +
 HPC1550 hybrid capacitor; the HPC supplies the Zigbee TX bursts the
 bare cell cannot.
 
+## Hardware: XIAO ESP32-C6 power path
+
+The target board is the **Seeed Studio XIAO ESP32-C6**, which uses
+two SG Micro power-management ICs near the BAT+/BAT- pads:
+
+- **SGM40567-4.2** — single-cell Li-Ion linear battery charger with
+  integrated power-path management. The `-4.2` suffix is the charge
+  termination voltage (4.2 V, standard for Li-Ion / LiPo). When USB
+  is plugged the IC routes 5 V to the system rail AND pushes a CC/CV
+  charge current into whatever's connected to BAT+. When USB is
+  unplugged the system seamlessly draws from BAT+.
+- **SGM6029C** — synchronous step-down (buck) DC-DC converter that
+  regulates the battery / USB rail down to the 3.3 V the ESP32-C6
+  runs on. Much more efficient than the simple LDO found on older
+  XIAO siblings, which is what lets the C6 reach sub-microamp sleep
+  numbers when battery-powered.
+
+### ⚠️ Warning when using LS14500 (or any primary cell)
+
+The SGM40567-4.2 **actively charges** whatever's wired to BAT+. That
+is fine for Li-Ion / LiPo cells, **but dangerous for the LS14500
+LiSOCl2 cell recommended below** — primary cells must never be
+charged. Connecting an LS14500 directly to BAT+ as-is can cause the
+cell to vent, leak corrosive electrolyte, or rupture.
+
+Before connecting an LS14500, choose one of:
+
+1. **Disable / desolder the SGM40567-4.2** (recommended). After
+   removal the BAT+ pad becomes a passive pad — wire LS14500 +
+   HPC1550 directly. This is also what the Seeed forum thread
+   suggests for primary-cell builds.
+2. **Series Schottky** between cell and BAT+ to block reverse
+   (charging) current. Cheap but leaves the charger trying to drive
+   an open output; use a low-leakage Schottky (e.g. PMEG2010).
+3. **Bypass the charger** entirely with an external ideal-diode IC
+   (LM66100) feeding the 3.3 V rail, leaving BAT+/BAT- unconnected.
+
+Rechargeable Li-Ion / LiPo cells need none of this — they work
+straight out of the box.
+
 ## Battery monitoring (optional, requires hardware)
 
 Recommended cell: **1x LS14500** (Saft LiSOCl2 AA, 3.6 V, ~2.6 Ah) in
 parallel with **1x HPC1550** (Tadiran hybrid layer capacitor, ~40 mAh)
-to buffer Zigbee TX current bursts.
+to buffer Zigbee TX current bursts. Make sure you've handled the
+SGM40567-4.2 charger as described in the previous section before
+connecting the cell.
 
 To enable battery reporting, wire the voltage divider:
 
