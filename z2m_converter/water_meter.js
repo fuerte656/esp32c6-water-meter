@@ -1,9 +1,12 @@
 const exposes = require('zigbee-herdsman-converters/lib/exposes');
 const reporting = require('zigbee-herdsman-converters/lib/reporting');
 const utils = require('zigbee-herdsman-converters/lib/utils');
+const fz = require('zigbee-herdsman-converters/converters/fromZigbee');
 const ea = exposes.access;
+const e = exposes.presets;
 
 const METER_ENDPOINTS = { meter1: 10, meter2: 11 };
+const BATTERY_ENDPOINT = METER_ENDPOINTS.meter1;
 
 function readUint48(raw) {
     if (raw === null || raw === undefined) return 0;
@@ -54,7 +57,7 @@ const definition = {
     model: 'ESP32C6_WATER',
     vendor: 'DIY',
     description: 'ESP32-C6 Zigbee impulse water meter (dual)',
-    fromZigbee: [fzWaterSummation],
+    fromZigbee: [fzWaterSummation, fz.battery],
     toZigbee: [tzWaterRead],
     exposes: [
         exposes.numeric('water_consumed', ea.STATE_GET)
@@ -73,6 +76,8 @@ const definition = {
             .withEndpoint('meter2')
             .withUnit('L')
             .withDescription('Total water consumed in liters (meter 2)'),
+        e.battery(),
+        e.battery_voltage(),
     ],
     endpoint: (device) => METER_ENDPOINTS,
     meta: { multiEndpoint: true },
@@ -87,6 +92,12 @@ const definition = {
                 reportableChange: 1,
             }]);
         }
+
+        /* Battery cluster lives on the first endpoint only. */
+        const battEp = device.getEndpoint(BATTERY_ENDPOINT);
+        await reporting.bind(battEp, coordinatorEndpoint, ['genPowerCfg']);
+        await reporting.batteryPercentageRemaining(battEp);
+        await reporting.batteryVoltage(battEp);
     },
 };
 
