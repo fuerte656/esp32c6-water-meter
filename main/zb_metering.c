@@ -1,4 +1,8 @@
-/* Zigbee Metering cluster wiring for the water meter.
+/* Zigbee Metering cluster wiring for the dual-meter water counter.
+ *
+ * Registers one endpoint per physical meter (WM_NUM_METERS), each
+ * exposing Basic / Identify / Metering. PowerCfg lives on the first
+ * endpoint only because there's a single battery.
  *
  * Adapts to the WM_POWER_USB / WM_DEEP_SLEEP / WM_BATTERY_MONITORING
  * flags in wm_config.h:
@@ -24,9 +28,14 @@ static const char *TAG = "wm_zb";
 
 #define ZCL_METERING_CURRENT_SUMMATION_DELIVERED_ID  0x0000
 
+static const uint8_t s_endpoints[WM_NUM_METERS] = {
+    WM_ESP_ZB_ENDPOINT_1,
+    WM_ESP_ZB_ENDPOINT_2,
+};
+
 static bool s_joined = false;
 
-static esp_zb_uint48_t s_summation = { .low = 0, .high = 0 };
+static esp_zb_uint48_t s_summation[WM_NUM_METERS] = {0};
 
 #if WM_BATTERY_MONITORING
 static uint8_t s_batt_percent_zcl = 200; /* ZCL units = 0.5 % */
@@ -62,16 +71,9 @@ static void build_zcl_string(char *dest, size_t dest_size, const char *src)
 
 /* ---------- cluster construction --------------------------------------- */
 
-static esp_zb_cluster_list_t *create_clusters(void)
+static esp_zb_cluster_list_t *create_clusters(int idx)
 {
     esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-
-    build_zcl_string(s_manuf, sizeof(s_manuf), "DIY");
-    build_zcl_string(s_model, sizeof(s_model), "ESP32C6.WaterMeter");
-
-    ESP_LOGI(TAG, "Setting Manufacturer='%.*s' (len=%d), Model='%.*s' (len=%d)",
-             (int)s_manuf[0], &s_manuf[1], (int)s_manuf[0],
-             (int)s_model[0], &s_model[1], (int)s_model[0]);
 
     /* Basic cluster */
     esp_zb_basic_cluster_cfg_t basic_cfg = {
@@ -97,7 +99,8 @@ static esp_zb_cluster_list_t *create_clusters(void)
     esp_zb_attribute_list_t *metering = esp_zb_zcl_attr_list_create(
         ESP_ZB_ZCL_CLUSTER_ID_METERING);
 
-    static esp_zb_uint48_t init_summation = { .low = 0, .high = 0 };
+    /* Per-meter init summation so each endpoint owns its own storage. */
+    static esp_zb_uint48_t init_summation[WM_NUM_METERS] = {0};
     static uint8_t  status_attr = 0x00;
     static uint8_t  uom_attr    = 0x01;       /* m^3 */
     static uint8_t  fmt_attr    = 0x40;       /* 4 digits left, 0 right */
@@ -110,7 +113,7 @@ static esp_zb_cluster_list_t *create_clusters(void)
         ZCL_METERING_CURRENT_SUMMATION_DELIVERED_ID,
         ESP_ZB_ZCL_ATTR_TYPE_U48,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-        &init_summation);
+        &init_summation[idx]);
 
     esp_zb_cluster_add_attr(metering,
         ESP_ZB_ZCL_CLUSTER_ID_METERING,
@@ -158,26 +161,28 @@ static esp_zb_cluster_list_t *create_clusters(void)
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 #if WM_BATTERY_MONITORING
-    /* Power Configuration cluster (0x0001). */
-    esp_zb_attribute_list_t *power = esp_zb_zcl_attr_list_create(
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
+    /* Power Configuration cluster (0x0001) - only on first endpoint. */
+    if (idx == 0) {
+        esp_zb_attribute_list_t *power = esp_zb_zcl_attr_list_create(
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
 
-    esp_zb_cluster_add_attr(power,
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-        0x0020,                                    /* BatteryVoltage */
-        ESP_ZB_ZCL_ATTR_TYPE_U8,
-        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-        &s_batt_voltage_x100);
+        esp_zb_cluster_add_attr(power,
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            0x0020,                                    /* BatteryVoltage */
+            ESP_ZB_ZCL_ATTR_TYPE_U8,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+            &s_batt_voltage_x100);
 
-    esp_zb_cluster_add_attr(power,
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-        0x0021,                                    /* BatteryPercentageRemaining */
-        ESP_ZB_ZCL_ATTR_TYPE_U8,
-        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-        &s_batt_percent_zcl);
+        esp_zb_cluster_add_attr(power,
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            0x0021,                                    /* BatteryPercentageRemaining */
+            ESP_ZB_ZCL_ATTR_TYPE_U8,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+            &s_batt_percent_zcl);
 
-    esp_zb_cluster_list_add_power_config_cluster(cluster_list, power,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+        esp_zb_cluster_list_add_power_config_cluster(cluster_list, power,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    }
 #endif
 
     return cluster_list;
@@ -185,15 +190,25 @@ static esp_zb_cluster_list_t *create_clusters(void)
 
 static void register_endpoint(void)
 {
+    build_zcl_string(s_manuf, sizeof(s_manuf), "DIY");
+    build_zcl_string(s_model, sizeof(s_model), "ESP32C6.WaterMeter");
+
+    ESP_LOGI(TAG, "Setting Manufacturer='%.*s' (len=%d), Model='%.*s' (len=%d)",
+             (int)s_manuf[0], &s_manuf[1], (int)s_manuf[0],
+             (int)s_model[0], &s_model[1], (int)s_model[0]);
+
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 
-    esp_zb_endpoint_config_t ep_cfg = {
-        .endpoint = WM_ESP_ZB_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id  = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
-        .app_device_version = 0,
-    };
-    esp_zb_ep_list_add_ep(ep_list, create_clusters(), ep_cfg);
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        esp_zb_endpoint_config_t ep_cfg = {
+            .endpoint = s_endpoints[i],
+            .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+            .app_device_id  = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+            .app_device_version = 0,
+        };
+        esp_zb_ep_list_add_ep(ep_list, create_clusters(i), ep_cfg);
+    }
+
     esp_zb_device_register(ep_list);
 }
 
@@ -254,25 +269,27 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
 /* ---------- Public API ------------------------------------------------- */
 
-void zb_metering_update_total(uint64_t liters_x1000)
+void zb_metering_update_total(int idx, uint64_t liters_x1000)
 {
+    if (idx < 0 || idx >= WM_NUM_METERS) return;
+
     uint64_t liters = liters_x1000 / 1000ULL;
-    pack_uint48(liters, &s_summation);
+    pack_uint48(liters, &s_summation[idx]);
 
     esp_zb_lock_acquire(portMAX_DELAY);
 
     esp_zb_zcl_status_t st = esp_zb_zcl_set_attribute_val(
-        WM_ESP_ZB_ENDPOINT,
+        s_endpoints[idx],
         ESP_ZB_ZCL_CLUSTER_ID_METERING,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ZCL_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-        &s_summation, false);
+        &s_summation[idx], false);
 
     esp_err_t send_err = ESP_ERR_NOT_SUPPORTED;
     if (s_joined) {
         esp_zb_zcl_report_attr_cmd_t report = {
             .zcl_basic_cmd = {
-                .src_endpoint = WM_ESP_ZB_ENDPOINT,
+                .src_endpoint = s_endpoints[idx],
             },
             .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
             .clusterID    = ESP_ZB_ZCL_CLUSTER_ID_METERING,
@@ -284,12 +301,12 @@ void zb_metering_update_total(uint64_t liters_x1000)
     }
     esp_zb_lock_release();
 
-    static uint64_t last_logged = UINT64_MAX;
-    if (liters != last_logged) {
-        ESP_LOGI(TAG, "Summation = %llu L (set=0x%x, joined=%d, send=%s)",
-                 (unsigned long long)liters, st, s_joined,
+    static uint64_t last_logged[WM_NUM_METERS] = { UINT64_MAX, UINT64_MAX };
+    if (liters != last_logged[idx]) {
+        ESP_LOGI(TAG, "meter[%d] summation = %llu L (set=0x%x, joined=%d, send=%s)",
+                 idx, (unsigned long long)liters, st, s_joined,
                  esp_err_to_name(send_err));
-        last_logged = liters;
+        last_logged[idx] = liters;
     }
 }
 
@@ -301,7 +318,7 @@ void zb_metering_update_battery(uint8_t percent)
 
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_set_attribute_val(
-        WM_ESP_ZB_ENDPOINT,
+        WM_ESP_ZB_ENDPOINT_1,
         ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         0x0021,
@@ -309,7 +326,7 @@ void zb_metering_update_battery(uint8_t percent)
 
     if (s_joined) {
         esp_zb_zcl_report_attr_cmd_t report = {
-            .zcl_basic_cmd  = { .src_endpoint = WM_ESP_ZB_ENDPOINT },
+            .zcl_basic_cmd  = { .src_endpoint = WM_ESP_ZB_ENDPOINT_1 },
             .address_mode   = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
             .clusterID      = ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
             .manuf_code     = 0,

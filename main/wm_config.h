@@ -68,8 +68,16 @@
  * =================================================================
  */
 
-/* GPIO connected to the reed/hall switch (other side to GND). */
-#define WM_PULSE_GPIO            2
+/* Number of independent water meters wired to this device. Each meter
+ * gets its own GPIO, PCNT unit, RTC total, NVS key, and Zigbee
+ * endpoint. Pulse weight (liters/pulse) is shared. */
+#define WM_NUM_METERS            2
+
+/* GPIOs connected to the reed/hall switches (other side to GND).
+ * Both must be LP/RTC-capable on ESP32-C6 (GPIO 0..7) so they can
+ * wake the chip from deep sleep. */
+#define WM_PULSE_GPIO_1          2
+#define WM_PULSE_GPIO_2          5
 
 /* GPIO for battery voltage divider, only used when monitoring on. */
 #define WM_BATTERY_ADC_GPIO      4
@@ -103,7 +111,8 @@
  * =================================================================
  */
 
-#define WM_ESP_ZB_ENDPOINT       10
+#define WM_ESP_ZB_ENDPOINT_1     10
+#define WM_ESP_ZB_ENDPOINT_2     11
 
 /* Reporting intervals for the Metering cluster. */
 #define WM_REPORT_MIN_INTERVAL_S 10

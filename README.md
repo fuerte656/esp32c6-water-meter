@@ -1,5 +1,16 @@
 # ESP32-C6 Zigbee Water Meter - Build Guide
 
+This firmware supports **two independent water meters** on a single
+ESP32-C6:
+
+- Meter 1: reed switch on **GPIO 2** -> GND, Zigbee endpoint **10**
+- Meter 2: reed switch on **GPIO 5** -> GND, Zigbee endpoint **11**
+
+Both share the same pulse weight (`WM_LITERS_PER_PULSE_X1000`). The
+Z2M converter in `z2m_converter/water_meter.js` exposes each meter as
+`water_consumed_meter1` / `water_consumed_meter2` (m³) plus the
+matching `_liters` variants.
+
 ## Operating modes
 
 The firmware can be built in three modes by toggling flags in
@@ -110,8 +121,12 @@ IEEE address). HA discovery republishes automatically.
   during the ~50 ms sleep-entry window are lost. For typical home
   water flow (a few pulses per minute max) this is rare.
 - Each deep-sleep wake takes ~3-4 seconds to rejoin parent + send
-  report. Cumulative pulse counter lives in RTC slow memory so it
-  survives across wakes.
+  report. Both cumulative counters live in RTC slow memory so they
+  survive across wakes.
+- In deep sleep both reed-switch GPIOs are configured as wake-on-low
+  sources. On wake, each line is sampled - whichever is still closed
+  is credited with one pulse. If both fire simultaneously, both get
+  credited.
 - Don't reduce WM_KEEPALIVE_PERIOD_S below ~5 min - it just burns
   battery for negligible benefit (HA already knows the device exists
   via the last seMetering report).

@@ -1,11 +1,13 @@
-/* ESP32-C6 Zigbee Water Meter
+/* ESP32-C6 Zigbee Dual Water Meter
  *
- * Counts pulses from a reed/hall-switch water meter, persists the
- * total to NVS, and reports it over Zigbee using the Smart Energy
- * Metering cluster. Operates as Router on USB power, or End Device
- * (optionally with deep sleep) on batteries.
+ * Counts pulses from up to WM_NUM_METERS reed/hall-switch water
+ * meters, persists each total to NVS, and reports them over Zigbee
+ * using the Smart Energy Metering cluster (one endpoint per meter).
+ * Operates as Router on USB power, or End Device (optionally with
+ * deep sleep) on batteries.
  *
- * See wm_config.h for the WM_POWER_USB / WM_DEEP_SLEEP flags.
+ * See wm_config.h for the WM_POWER_USB / WM_DEEP_SLEEP flags and the
+ * per-meter GPIO assignments.
  */
 
 #include "freertos/FreeRTOS.h"
@@ -29,7 +31,7 @@ static const char *TAG = "wm_main";
 /* =====================================================================
  * USB / always-on supervisor task
  * Runs in both WM_POWER_USB=1 mode and WM_POWER_USB=0,WM_DEEP_SLEEP=0
- * mode. Polls the counter every second, pushes changes to Zigbee,
+ * mode. Polls the counters every second, pushes changes to Zigbee,
  * and persists to NVS at the configured cadence.
  * =====================================================================
  */
@@ -37,41 +39,50 @@ static const char *TAG = "wm_main";
 
 static void supervisor_task(void *arg)
 {
-    uint64_t last_pushed   = UINT64_MAX;
-    uint64_t last_saved    = pulse_counter_get_total_liters_x1000();
-    int64_t  last_save_us  = esp_timer_get_time();
+    uint64_t last_pushed[WM_NUM_METERS];
+    uint64_t last_saved[WM_NUM_METERS];
+    int64_t  last_save_us[WM_NUM_METERS];
+
+    int64_t now_us0 = esp_timer_get_time();
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        last_pushed[i]  = UINT64_MAX;
+        last_saved[i]   = pulse_counter_get_total_liters_x1000(i);
+        last_save_us[i] = now_us0;
+    }
 
 #if WM_BATTERY_MONITORING
     int64_t  last_batt_us  = 0;
 #endif
 
     while (1) {
-        int new_pulses = pulse_counter_take();
-        uint64_t total_x1000 = pulse_counter_get_total_liters_x1000();
-
-        if (total_x1000 != last_pushed) {
-            if (new_pulses > 0) {
-                ESP_LOGI(TAG, "+%d pulses (total=%llu L x1000)",
-                         new_pulses, (unsigned long long)total_x1000);
-            }
-            zb_metering_update_total(total_x1000);
-            last_pushed = total_x1000;
-        }
-
         int64_t now_us = esp_timer_get_time();
 
-        bool time_due  = (now_us - last_save_us) >=
-                         (int64_t)WM_NVS_FLUSH_PERIOD_S * 1000000LL;
-        bool delta_due = (total_x1000 > last_saved) &&
-                         (total_x1000 - last_saved) >=
-                         (uint64_t)WM_NVS_FLUSH_DELTA_LITERS * 1000ULL;
+        for (int i = 0; i < WM_NUM_METERS; i++) {
+            int new_pulses = pulse_counter_take(i);
+            uint64_t total_x1000 = pulse_counter_get_total_liters_x1000(i);
 
-        if (total_x1000 != last_saved && (time_due || delta_due)) {
-            storage_save_liters_x1000(total_x1000);
-            ESP_LOGI(TAG, "persisted total: %llu L (x1000)",
-                     (unsigned long long)total_x1000);
-            last_saved   = total_x1000;
-            last_save_us = now_us;
+            if (total_x1000 != last_pushed[i]) {
+                if (new_pulses > 0) {
+                    ESP_LOGI(TAG, "meter[%d] +%d pulses (total=%llu L x1000)",
+                             i, new_pulses, (unsigned long long)total_x1000);
+                }
+                zb_metering_update_total(i, total_x1000);
+                last_pushed[i] = total_x1000;
+            }
+
+            bool time_due  = (now_us - last_save_us[i]) >=
+                             (int64_t)WM_NVS_FLUSH_PERIOD_S * 1000000LL;
+            bool delta_due = (total_x1000 > last_saved[i]) &&
+                             (total_x1000 - last_saved[i]) >=
+                             (uint64_t)WM_NVS_FLUSH_DELTA_LITERS * 1000ULL;
+
+            if (total_x1000 != last_saved[i] && (time_due || delta_due)) {
+                storage_save_liters_x1000(i, total_x1000);
+                ESP_LOGI(TAG, "meter[%d] persisted total: %llu L (x1000)",
+                         i, (unsigned long long)total_x1000);
+                last_saved[i]   = total_x1000;
+                last_save_us[i] = now_us;
+            }
         }
 
 #if WM_BATTERY_MONITORING
@@ -92,8 +103,8 @@ static void supervisor_task(void *arg)
 /* =====================================================================
  * Deep-sleep wake handler (WM_USE_DEEP_SLEEP=1 only)
  * Each wake runs app_main from scratch. We figure out why we woke,
- * count any pulses that happened, send a Zigbee report, and go back
- * to sleep.
+ * count any pulses on whichever GPIO is low, send Zigbee reports for
+ * every meter, and go back to sleep.
  * =====================================================================
  */
 #if WM_USE_DEEP_SLEEP
@@ -104,19 +115,24 @@ static void deep_sleep_cycle(void)
 {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
-    /* On GPIO wake, the pulse already fired. Software-debounce by
-     * sampling the line: it should still be low (closed) if it was
-     * a real pulse. */
     if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-        gpio_set_direction(WM_PULSE_GPIO, GPIO_MODE_INPUT);
-        gpio_pullup_en(WM_PULSE_GPIO);
+        /* Software-debounce by sampling each pulse line: any that's
+         * still low (closed) is a real pulse. With two meters it's
+         * possible (though unlikely) for both to fire in the same
+         * wake-up window - we count each one individually. */
+        for (int i = 0; i < WM_NUM_METERS; i++) {
+            int gpio = pulse_counter_gpio(i);
+            gpio_set_direction(gpio, GPIO_MODE_INPUT);
+            gpio_pullup_en(gpio);
+        }
         vTaskDelay(pdMS_TO_TICKS(WM_SW_DEBOUNCE_MS));
 
-        if (gpio_get_level(WM_PULSE_GPIO) == 0) {
-            pulse_counter_increment_one();
-            ESP_LOGI(TAG, "Wake from GPIO: counted 1 pulse");
-        } else {
-            ESP_LOGI(TAG, "Wake from GPIO: glitch, ignored");
+        for (int i = 0; i < WM_NUM_METERS; i++) {
+            int gpio = pulse_counter_gpio(i);
+            if (gpio_get_level(gpio) == 0) {
+                pulse_counter_increment_one(i);
+                ESP_LOGI(TAG, "Wake from GPIO: meter[%d] +1 pulse", i);
+            }
         }
     } else if (cause == ESP_SLEEP_WAKEUP_TIMER) {
         ESP_LOGI(TAG, "Wake from timer (keepalive)");
@@ -124,28 +140,29 @@ static void deep_sleep_cycle(void)
         ESP_LOGI(TAG, "Wake cause: %d (cold boot or reset)", cause);
     }
 
-    uint64_t total_x1000 = pulse_counter_get_total_liters_x1000();
-    ESP_LOGI(TAG, "Total now: %llu L x1000", (unsigned long long)total_x1000);
+    /* Push every meter's value to Zigbee and persist to NVS. */
+    uint64_t wake_mask = 0;
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        uint64_t total_x1000 = pulse_counter_get_total_liters_x1000(i);
+        ESP_LOGI(TAG, "meter[%d] total now: %llu L x1000",
+                 i, (unsigned long long)total_x1000);
+        zb_metering_update_total(i, total_x1000);
+        storage_save_liters_x1000(i, total_x1000);
 
-    /* Push the value to Zigbee. The stack will rejoin our parent
-     * automatically; we wait a bit for the report to flush. */
-    zb_metering_update_total(total_x1000);
+        wake_mask |= BIT64(pulse_counter_gpio(i));
+    }
 
 #if WM_BATTERY_MONITORING
     uint8_t pct = battery_read_percent();
     zb_metering_update_battery(pct);
 #endif
 
-    /* Persist to NVS only if it has been a while since last save,
-     * to limit flash wear. With deep sleep there's no risk of losing
-     * the counter on power-loss because RTC RAM holds it. */
-    storage_save_liters_x1000(total_x1000);
-
-    /* Give Zigbee ~3 seconds to actually send the report. */
+    /* Give Zigbee ~3 seconds to actually send the reports. */
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    /* Configure both wake sources and sleep. */
-    esp_deep_sleep_enable_gpio_wakeup(BIT64(WM_PULSE_GPIO),
+    /* Configure all meter GPIOs + the keepalive timer as wake sources
+     * and sleep. */
+    esp_deep_sleep_enable_gpio_wakeup(wake_mask,
                                       ESP_GPIO_WAKEUP_GPIO_LOW);
     esp_sleep_enable_timer_wakeup((uint64_t)WM_KEEPALIVE_PERIOD_S * 1000000ULL);
 
@@ -161,17 +178,20 @@ static void deep_sleep_cycle(void)
  */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-C6 Zigbee water meter starting");
+    ESP_LOGI(TAG, "ESP32-C6 Zigbee water meter starting (%d meters)",
+             WM_NUM_METERS);
     ESP_LOGI(TAG, "Mode: %s, %s%s",
              WM_POWER_USB ? "USB/Router" : "Battery/EndDevice",
              WM_USE_DEEP_SLEEP ? "deep-sleep" : "always-on",
              WM_BATTERY_MONITORING ? ", battery-mon" : "");
 
     ESP_ERROR_CHECK(storage_init());
-    uint64_t saved = storage_load_liters_x1000();
 
     ESP_ERROR_CHECK(pulse_counter_init());
-    pulse_counter_set_initial_liters_x1000(saved);
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        uint64_t saved = storage_load_liters_x1000(i);
+        pulse_counter_set_initial_liters_x1000(i, saved);
+    }
 
 #if WM_BATTERY_MONITORING
     ESP_ERROR_CHECK(battery_init());

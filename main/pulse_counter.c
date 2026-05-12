@@ -1,16 +1,18 @@
-/* PCNT-based pulse counter for the water meter.
+/* PCNT-based pulse counter for the water meters.
  *
- * In always-on modes (USB router, ED no-sleep) the PCNT peripheral
- * counts hardware pulses with a glitch filter, and a watchpoint
+ * Supports WM_NUM_METERS independent meters, each on its own GPIO.
+ *
+ * In always-on modes (USB router, ED no-sleep) one PCNT unit per
+ * meter counts hardware pulses with a glitch filter, and a watchpoint
  * callback applies a software debounce on top.
  *
  * In deep-sleep mode the PCNT is off most of the time (the chip is
  * sleeping), so wakes from GPIO call pulse_counter_increment_one()
  * manually after a software debounce.
  *
- * The cumulative total lives in RTC slow memory so it survives deep
- * sleep without an NVS write per pulse. NVS is still used as the
- * persistent backup against power loss.
+ * Each meter's cumulative total lives in RTC slow memory so it
+ * survives deep sleep without an NVS write per pulse. NVS is still
+ * used as the persistent backup against power loss.
  */
 
 #include "pulse_counter.h"
@@ -25,24 +27,34 @@
 #include "freertos/task.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 
 static const char *TAG = "wm_pcnt";
 
-/* Cumulative total in liters * 1000. Lives in RTC slow memory so it
- * survives deep sleep. RTC slow memory is initialised to 0 only on a
- * cold boot (power-on / external reset); it persists across deep
- * sleep wake-ups. */
-RTC_DATA_ATTR static uint64_t s_total_x1000 = 0;
+static const int s_gpios[WM_NUM_METERS] = {
+    WM_PULSE_GPIO_1,
+    WM_PULSE_GPIO_2,
+};
 
-/* Set by pulse_counter_set_initial_liters_x1000. Used by
- * pulse_counter_take so we can return cumulative-from-baseline. */
-static atomic_int s_pulses_since_take = 0;
+/* Cumulative totals in liters * 1000, one per meter. Live in RTC slow
+ * memory so they survive deep sleep. RTC slow memory is initialised
+ * to 0 only on a cold boot (power-on / external reset); it persists
+ * across deep-sleep wake-ups. */
+RTC_DATA_ATTR static uint64_t s_total_x1000[WM_NUM_METERS] = {0};
+
+/* Pulses observed since the last pulse_counter_take(idx). */
+static atomic_int s_pulses_since_take[WM_NUM_METERS];
 
 #if !WM_USE_DEEP_SLEEP
-static pcnt_unit_handle_t s_unit = NULL;
-static pcnt_channel_handle_t s_chan = NULL;
-static int64_t s_last_pulse_us = 0;
+static pcnt_unit_handle_t    s_unit[WM_NUM_METERS] = {0};
+static pcnt_channel_handle_t s_chan[WM_NUM_METERS] = {0};
+static int64_t               s_last_pulse_us[WM_NUM_METERS] = {0};
 #endif
+
+int pulse_counter_gpio(int idx)
+{
+    return (idx >= 0 && idx < WM_NUM_METERS) ? s_gpios[idx] : -1;
+}
 
 /* ---------- always-on (PCNT) variant ---------- */
 
@@ -52,13 +64,14 @@ static bool IRAM_ATTR pcnt_watch_cb(pcnt_unit_handle_t unit,
                                     const pcnt_watch_event_data_t *edata,
                                     void *user_ctx)
 {
+    int idx = (int)(intptr_t)user_ctx;
     int64_t now = esp_timer_get_time();
-    if ((now - s_last_pulse_us) >=
+    if ((now - s_last_pulse_us[idx]) >=
         (int64_t)WM_SW_DEBOUNCE_MS * 1000LL)
     {
-        s_last_pulse_us = now;
-        atomic_fetch_add(&s_pulses_since_take, 1);
-        s_total_x1000 += WM_LITERS_PER_PULSE_X1000;
+        s_last_pulse_us[idx] = now;
+        atomic_fetch_add(&s_pulses_since_take[idx], 1);
+        s_total_x1000[idx] += WM_LITERS_PER_PULSE_X1000;
     }
     /* Reset the count so we can fire the watchpoint again on next
      * pulse. */
@@ -66,47 +79,57 @@ static bool IRAM_ATTR pcnt_watch_cb(pcnt_unit_handle_t unit,
     return false;
 }
 
-esp_err_t pulse_counter_init(void)
+static esp_err_t init_one(int idx)
 {
-    ESP_LOGI(TAG, "init pcnt on GPIO %d, glitch %d ns, sw debounce %d ms",
-             WM_PULSE_GPIO, WM_PCNT_GLITCH_NS, WM_SW_DEBOUNCE_MS);
+    ESP_LOGI(TAG, "init pcnt[%d] on GPIO %d, glitch %d ns, sw debounce %d ms",
+             idx, s_gpios[idx], WM_PCNT_GLITCH_NS, WM_SW_DEBOUNCE_MS);
 
     pcnt_unit_config_t unit_cfg = {
         .high_limit = 10000,
         .low_limit  = -1,
         .flags.accum_count = false,
     };
-    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &s_unit));
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &s_unit[idx]));
 
     pcnt_glitch_filter_config_t filt = {
         .max_glitch_ns = WM_PCNT_GLITCH_NS,
     };
-    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(s_unit, &filt));
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(s_unit[idx], &filt));
 
     pcnt_chan_config_t chan_cfg = {
-        .edge_gpio_num  = WM_PULSE_GPIO,
+        .edge_gpio_num  = s_gpios[idx],
         .level_gpio_num = -1,
         .flags.io_loop_back = false,
     };
-    ESP_ERROR_CHECK(pcnt_new_channel(s_unit, &chan_cfg, &s_chan));
+    ESP_ERROR_CHECK(pcnt_new_channel(s_unit[idx], &chan_cfg, &s_chan[idx]));
 
     /* Count on falling edges only (reed switch closes -> GND). */
-    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(s_chan,
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(s_chan[idx],
         PCNT_CHANNEL_EDGE_ACTION_DECREASE,
         PCNT_CHANNEL_EDGE_ACTION_INCREASE));
 
     /* Internal pull-up on the input pin (reed switch shorts to GND). */
-    gpio_pullup_en(WM_PULSE_GPIO);
+    gpio_pullup_en(s_gpios[idx]);
 
     /* Watchpoint at +1 so we get a callback every pulse. */
-    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(s_unit, 1));
+    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(s_unit[idx], 1));
 
     pcnt_event_callbacks_t cbs = { .on_reach = pcnt_watch_cb };
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(s_unit, &cbs, NULL));
+    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(s_unit[idx], &cbs,
+        (void *)(intptr_t)idx));
 
-    ESP_ERROR_CHECK(pcnt_unit_enable(s_unit));
-    ESP_ERROR_CHECK(pcnt_unit_clear_count(s_unit));
-    ESP_ERROR_CHECK(pcnt_unit_start(s_unit));
+    ESP_ERROR_CHECK(pcnt_unit_enable(s_unit[idx]));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(s_unit[idx]));
+    ESP_ERROR_CHECK(pcnt_unit_start(s_unit[idx]));
+    return ESP_OK;
+}
+
+esp_err_t pulse_counter_init(void)
+{
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        atomic_store(&s_pulses_since_take[i], 0);
+        ESP_ERROR_CHECK(init_one(i));
+    }
     return ESP_OK;
 }
 
@@ -115,9 +138,11 @@ esp_err_t pulse_counter_init(void)
 esp_err_t pulse_counter_init(void)
 {
     ESP_LOGI(TAG, "deep-sleep mode: PCNT not used; pulses counted via GPIO wake");
-    /* Configure GPIO as input + pull-up so it idles high. */
-    gpio_set_direction(WM_PULSE_GPIO, GPIO_MODE_INPUT);
-    gpio_pullup_en(WM_PULSE_GPIO);
+    for (int i = 0; i < WM_NUM_METERS; i++) {
+        atomic_store(&s_pulses_since_take[i], 0);
+        gpio_set_direction(s_gpios[i], GPIO_MODE_INPUT);
+        gpio_pullup_en(s_gpios[i]);
+    }
     return ESP_OK;
 }
 
@@ -125,34 +150,38 @@ esp_err_t pulse_counter_init(void)
 
 /* ---------- common API ---------- */
 
-void pulse_counter_set_initial_liters_x1000(uint64_t value)
+void pulse_counter_set_initial_liters_x1000(int idx, uint64_t value)
 {
+    if (idx < 0 || idx >= WM_NUM_METERS) return;
     /* Only seed from NVS on cold boot. RTC RAM persists across
      * deep-sleep wakes, so we must NOT clobber it then. */
-    if (s_total_x1000 == 0) {
-        s_total_x1000 = value;
-        ESP_LOGI(TAG, "restored initial total: %llu (liters x1000)",
-                 (unsigned long long)value);
+    if (s_total_x1000[idx] == 0) {
+        s_total_x1000[idx] = value;
+        ESP_LOGI(TAG, "meter[%d] restored initial total: %llu (liters x1000)",
+                 idx, (unsigned long long)value);
     } else {
-        ESP_LOGI(TAG, "RTC RAM already has %llu, NVS=%llu, keeping RTC",
-                 (unsigned long long)s_total_x1000,
+        ESP_LOGI(TAG, "meter[%d] RTC RAM already has %llu, NVS=%llu, keeping RTC",
+                 idx,
+                 (unsigned long long)s_total_x1000[idx],
                  (unsigned long long)value);
     }
 }
 
-int pulse_counter_take(void)
+int pulse_counter_take(int idx)
 {
-    int n = atomic_exchange(&s_pulses_since_take, 0);
-    return n;
+    if (idx < 0 || idx >= WM_NUM_METERS) return 0;
+    return atomic_exchange(&s_pulses_since_take[idx], 0);
 }
 
-uint64_t pulse_counter_get_total_liters_x1000(void)
+uint64_t pulse_counter_get_total_liters_x1000(int idx)
 {
-    return s_total_x1000;
+    if (idx < 0 || idx >= WM_NUM_METERS) return 0;
+    return s_total_x1000[idx];
 }
 
-void pulse_counter_increment_one(void)
+void pulse_counter_increment_one(int idx)
 {
-    s_total_x1000 += WM_LITERS_PER_PULSE_X1000;
-    atomic_fetch_add(&s_pulses_since_take, 1);
+    if (idx < 0 || idx >= WM_NUM_METERS) return;
+    s_total_x1000[idx] += WM_LITERS_PER_PULSE_X1000;
+    atomic_fetch_add(&s_pulses_since_take[idx], 1);
 }

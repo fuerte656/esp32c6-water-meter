@@ -1,6 +1,9 @@
 const exposes = require('zigbee-herdsman-converters/lib/exposes');
 const reporting = require('zigbee-herdsman-converters/lib/reporting');
+const utils = require('zigbee-herdsman-converters/lib/utils');
 const ea = exposes.access;
+
+const METER_ENDPOINTS = { meter1: 10, meter2: 11 };
 
 function readUint48(raw) {
     if (raw === null || raw === undefined) return 0;
@@ -22,15 +25,17 @@ const fzWaterSummation = {
     type: ['attributeReport', 'readResponse'],
     convert: (model, msg, publish, options, meta) => {
         if (meta && meta.logger) {
-            meta.logger.info(`[water_meter] seMetering report: ${JSON.stringify(msg.data)}`);
+            meta.logger.info(`[water_meter] seMetering ep=${msg.endpoint.ID}: ${JSON.stringify(msg.data)}`);
         }
-        const result = {};
-        if (msg.data && msg.data.currentSummDelivered !== undefined) {
-            const liters = readUint48(msg.data.currentSummDelivered);
-            result.water_consumed = Number((liters / 1000).toFixed(3));
-            result.water_consumed_liters = liters;
+        if (!msg.data || msg.data.currentSummDelivered === undefined) {
+            return {};
         }
-        return result;
+        const liters = readUint48(msg.data.currentSummDelivered);
+        const payload = {
+            water_consumed: Number((liters / 1000).toFixed(3)),
+            water_consumed_liters: liters,
+        };
+        return utils.postfixWithEndpointName(payload, msg, model, meta);
     },
 };
 
@@ -48,28 +53,41 @@ const definition = {
     zigbeeModel: ['esp32c6', 'ESP32C6.WaterMeter'],
     model: 'ESP32C6_WATER',
     vendor: 'DIY',
-    description: 'ESP32-C6 Zigbee impulse water meter',
+    description: 'ESP32-C6 Zigbee impulse water meter (dual)',
     fromZigbee: [fzWaterSummation],
     toZigbee: [tzWaterRead],
     exposes: [
         exposes.numeric('water_consumed', ea.STATE_GET)
+            .withEndpoint('meter1')
             .withUnit('m³')
-            .withDescription('Total water consumed'),
+            .withDescription('Total water consumed (meter 1)'),
         exposes.numeric('water_consumed_liters', ea.STATE_GET)
+            .withEndpoint('meter1')
             .withUnit('L')
-            .withDescription('Total water consumed in liters'),
+            .withDescription('Total water consumed in liters (meter 1)'),
+        exposes.numeric('water_consumed', ea.STATE_GET)
+            .withEndpoint('meter2')
+            .withUnit('m³')
+            .withDescription('Total water consumed (meter 2)'),
+        exposes.numeric('water_consumed_liters', ea.STATE_GET)
+            .withEndpoint('meter2')
+            .withUnit('L')
+            .withDescription('Total water consumed in liters (meter 2)'),
     ],
+    endpoint: (device) => METER_ENDPOINTS,
+    meta: { multiEndpoint: true },
     configure: async (device, coordinatorEndpoint, logger) => {
-        const endpoint = device.getEndpoint(10);
-        await reporting.bind(endpoint, coordinatorEndpoint, ['seMetering']);
-        await endpoint.configureReporting('seMetering', [{
-            attribute: 'currentSummDelivered',
-            minimumReportInterval: 10,
-            maximumReportInterval: 3600,
-            reportableChange: 1,
-        }]);
+        for (const epId of Object.values(METER_ENDPOINTS)) {
+            const endpoint = device.getEndpoint(epId);
+            await reporting.bind(endpoint, coordinatorEndpoint, ['seMetering']);
+            await endpoint.configureReporting('seMetering', [{
+                attribute: 'currentSummDelivered',
+                minimumReportInterval: 10,
+                maximumReportInterval: 3600,
+                reportableChange: 1,
+            }]);
+        }
     },
-    meta: {},
 };
 
 module.exports = definition;
