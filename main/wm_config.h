@@ -4,8 +4,12 @@
  * ESP32-C6 Zigbee Water Meter - configuration
  * =================================================================
  *
- * Hardware: ESP32-C6 + reed switch on GPIO 2 (to GND).
- * Optional: TPS63020 + 3xAA for battery operation.
+ * Hardware: ESP32-C6 + reed switches on GPIO 2 and GPIO 5 (to GND).
+ * Optional: 1x LS14500 (LiSOCl2 AA, 3.6 V) + 1x HPC1550 (Tadiran
+ *           hybrid layer capacitor) in parallel for battery operation.
+ *           LiSOCl2 sits in spec for ESP32-C6 Vdd (3.0-3.6 V) for the
+ *           whole life of the cell, so no buck-boost is required; a
+ *           low-Iq LDO is optional for spike protection.
  * Optional: voltage divider on GPIO 4 (100k+100k) for battery sensing.
  *
  * Flip the flags below to choose the operating mode. Defaults match

@@ -88,8 +88,9 @@ static void supervisor_task(void *arg)
 #if WM_BATTERY_MONITORING
         /* Sample the battery roughly every minute. */
         if ((now_us - last_batt_us) >= 60LL * 1000000LL) {
-            uint8_t pct = battery_read_percent();
-            zb_metering_update_battery(pct);
+            uint32_t mv  = battery_read_mv();
+            uint8_t  pct = battery_read_percent();
+            zb_metering_update_battery(pct, mv);
             last_batt_us = now_us;
         }
 #endif
@@ -153,8 +154,9 @@ static void deep_sleep_cycle(void)
     }
 
 #if WM_BATTERY_MONITORING
-    uint8_t pct = battery_read_percent();
-    zb_metering_update_battery(pct);
+    uint32_t batt_mv  = battery_read_mv();
+    uint8_t  batt_pct = battery_read_percent();
+    zb_metering_update_battery(batt_pct, batt_mv);
 #endif
 
     /* Give Zigbee ~3 seconds to actually send the reports. */

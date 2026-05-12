@@ -51,9 +51,10 @@ idf.py -p COM4 flash monitor
 ```
 
 Behavior: Zigbee End Device, always awake, ~50 mA continuous.
-Estimated runtime on 3xAA alkaline: ~25 h. Useful as an intermediate
-test before deep-sleep, since the network rejoin behavior is the
-same as deep-sleep mode but without the sleep-wake state machine.
+Useful only as a bench test before deep-sleep, since the network
+rejoin behavior is the same as deep-sleep mode but without the
+sleep-wake state machine. **Not viable for real battery deployment**:
+a fresh LS14500 (~2.6 Ah) would last ~50 hours at 50 mA.
 
 ### 3. Battery / Deep Sleep
 
@@ -71,14 +72,20 @@ idf.py -p COM4 erase-flash
 idf.py -p COM4 flash monitor
 ```
 
-Behavior: chip sleeps in deep sleep until a pulse on GPIO 2 OR every
-WM_KEEPALIVE_PERIOD_S (default 15 min). On wake, joins parent, sends
-report, sleeps. ~50 uA average. Estimated 6-12 months on 3xAA
-lithium cells.
+Behavior: chip sleeps in deep sleep until a pulse on GPIO 2 / GPIO 5
+OR every WM_KEEPALIVE_PERIOD_S (default 15 min). On wake, joins
+parent, sends reports for both meters, sleeps. ~50 uA average.
+Estimated **~5 years** on a single LS14500 (LiSOCl2 AA, ~2.6 Ah) +
+HPC1550 hybrid capacitor; the HPC supplies the Zigbee TX bursts the
+bare cell cannot.
 
 ## Battery monitoring (optional, requires hardware)
 
-To enable battery percentage reporting, wire the voltage divider:
+Recommended cell: **1x LS14500** (Saft LiSOCl2 AA, 3.6 V, ~2.6 Ah) in
+parallel with **1x HPC1550** (Tadiran hybrid layer capacitor, ~40 mAh)
+to buffer Zigbee TX current bursts.
+
+To enable battery reporting, wire the voltage divider:
 
 ```
 Battery+ ----[100k ohm]----+----[100k ohm]---- GND
@@ -87,7 +94,20 @@ Battery+ ----[100k ohm]----+----[100k ohm]---- GND
 ```
 
 Then set `WM_BATTERY_MONITORING = 1` in wm_config.h and rebuild. The
-device will expose a `battery` sensor in HA.
+device will expose two attributes via the Zigbee PowerCfg cluster:
+
+- **BatteryVoltage** (raw mV, the most meaningful health signal for
+  LiSOCl2 since the chemistry is flat near 3.6 V for years).
+- **BatteryPercentageRemaining**, derived from voltage in discrete
+  buckets (100/70/40/15/5/0 %) because a linear percentage on a flat
+  curve is misleading.
+
+Replace the cell when voltage drops below ~3.3 V — that's the knee of
+the LiSOCl2 discharge curve; from there the cell typically lasts
+weeks, not months.
+
+ADC samples are averaged (16 reads spaced ~2 ms) so brief rail dips
+during Zigbee TX bursts don't corrupt the reading.
 
 ## Switching between modes
 

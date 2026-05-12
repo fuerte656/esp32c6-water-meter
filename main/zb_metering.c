@@ -38,8 +38,9 @@ static bool s_joined = false;
 static esp_zb_uint48_t s_summation[WM_NUM_METERS] = {0};
 
 #if WM_BATTERY_MONITORING
-static uint8_t s_batt_percent_zcl = 200; /* ZCL units = 0.5 % */
-static uint8_t s_batt_voltage_x100 = 33; /* ZCL units = 100 mV */
+/* 0xFF = "unknown" per ZCL until the first sample arrives. */
+static uint8_t s_batt_percent_zcl  = 0xFF; /* ZCL units = 0.5 %, 0xFF=unknown */
+static uint8_t s_batt_voltage_x100 = 0xFF; /* ZCL units = 100 mV, 0xFF=unknown */
 #endif
 
 /* Length-prefixed Zigbee strings, built at runtime to avoid C-literal
@@ -310,19 +311,37 @@ void zb_metering_update_total(int idx, uint64_t liters_x1000)
     }
 }
 
-void zb_metering_update_battery(uint8_t percent)
+void zb_metering_update_battery(uint8_t percent, uint32_t mv)
 {
 #if WM_BATTERY_MONITORING
     /* ZCL "BatteryPercentageRemaining" is in units of 0.5 %. */
     s_batt_percent_zcl = (percent > 100) ? 200 : (uint8_t)(percent * 2);
 
+    /* ZCL "BatteryVoltage" is in units of 100 mV, clamped to 0..0xFE.
+     * 0xFF means "unknown" - leave it that way if we have no reading. */
+    if (mv == 0) {
+        s_batt_voltage_x100 = 0xFF;
+    } else {
+        uint32_t v = (mv + 50) / 100;   /* round to nearest 100 mV */
+        if (v > 0xFE) v = 0xFE;
+        s_batt_voltage_x100 = (uint8_t)v;
+    }
+
     esp_zb_lock_acquire(portMAX_DELAY);
+
     esp_zb_zcl_set_attribute_val(
         WM_ESP_ZB_ENDPOINT_1,
         ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         0x0021,
         &s_batt_percent_zcl, false);
+
+    esp_zb_zcl_set_attribute_val(
+        WM_ESP_ZB_ENDPOINT_1,
+        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        0x0020,
+        &s_batt_voltage_x100, false);
 
     if (s_joined) {
         esp_zb_zcl_report_attr_cmd_t report = {
@@ -331,15 +350,20 @@ void zb_metering_update_battery(uint8_t percent)
             .clusterID      = ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
             .manuf_code     = 0,
             .attributeID    = 0x0021,
+            .direction      = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
         };
-        report.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        esp_zb_zcl_report_attr_cmd_req(&report);
+
+        report.attributeID = 0x0020;
         esp_zb_zcl_report_attr_cmd_req(&report);
     }
     esp_zb_lock_release();
 
-    ESP_LOGI(TAG, "battery: %u%%", percent);
+    ESP_LOGI(TAG, "battery: %u%% (%lu mV)",
+             percent, (unsigned long)mv);
 #else
     (void)percent;
+    (void)mv;
 #endif
 }
 
