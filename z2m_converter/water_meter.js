@@ -34,11 +34,14 @@ const fzWaterSummation = {
             return {};
         }
         const liters = readUint48(msg.data.currentSummDelivered);
-        const payload = {
-            water_consumed: Number((liters / 1000).toFixed(3)),
-            water_consumed_liters: liters,
+        const m3 = Number((liters / 1000).toFixed(3));
+        /* postfixWithEndpointName returns a SUFFIXED KEY STRING (e.g.
+         * "water_consumed_meter1"), not a payload object. Must be
+         * applied per-key. */
+        return {
+            [utils.postfixWithEndpointName('water_consumed', msg, model, meta)]: m3,
+            [utils.postfixWithEndpointName('water_consumed_liters', msg, model, meta)]: liters,
         };
-        return utils.postfixWithEndpointName(payload, msg, model, meta);
     },
 };
 
@@ -48,6 +51,36 @@ const tzWaterRead = {
         await entity.read('seMetering', ['currentSummDelivered']);
     },
 };
+
+function hasBatteryCluster(device) {
+    const ep = device && device.getEndpoint(BATTERY_ENDPOINT);
+    if (!ep) return false;
+    if (typeof ep.supportsInputCluster === 'function') {
+        return ep.supportsInputCluster('genPowerCfg');
+    }
+    /* Fallback for older zigbee-herdsman versions: inspect raw list. */
+    const ids = (ep.inputClusters || []).map((c) => (typeof c === 'object' ? c.ID : c));
+    return ids.includes(1); /* genPowerCfg = 0x0001 */
+}
+
+const baseExposes = [
+    exposes.numeric('water_consumed', ea.STATE_GET)
+        .withEndpoint('meter1')
+        .withUnit('m³')
+        .withDescription('Total water consumed (meter 1)'),
+    exposes.numeric('water_consumed_liters', ea.STATE_GET)
+        .withEndpoint('meter1')
+        .withUnit('L')
+        .withDescription('Total water consumed in liters (meter 1)'),
+    exposes.numeric('water_consumed', ea.STATE_GET)
+        .withEndpoint('meter2')
+        .withUnit('m³')
+        .withDescription('Total water consumed (meter 2)'),
+    exposes.numeric('water_consumed_liters', ea.STATE_GET)
+        .withEndpoint('meter2')
+        .withUnit('L')
+        .withDescription('Total water consumed in liters (meter 2)'),
+];
 
 const definition = {
     fingerprint: [
@@ -59,26 +92,15 @@ const definition = {
     description: 'ESP32-C6 Zigbee impulse water meter (dual)',
     fromZigbee: [fzWaterSummation, fz.battery],
     toZigbee: [tzWaterRead],
-    exposes: [
-        exposes.numeric('water_consumed', ea.STATE_GET)
-            .withEndpoint('meter1')
-            .withUnit('m³')
-            .withDescription('Total water consumed (meter 1)'),
-        exposes.numeric('water_consumed_liters', ea.STATE_GET)
-            .withEndpoint('meter1')
-            .withUnit('L')
-            .withDescription('Total water consumed in liters (meter 1)'),
-        exposes.numeric('water_consumed', ea.STATE_GET)
-            .withEndpoint('meter2')
-            .withUnit('m³')
-            .withDescription('Total water consumed (meter 2)'),
-        exposes.numeric('water_consumed_liters', ea.STATE_GET)
-            .withEndpoint('meter2')
-            .withUnit('L')
-            .withDescription('Total water consumed in liters (meter 2)'),
-        e.battery(),
-        e.battery_voltage(),
-    ],
+    /* Exposes is a function so we only advertise battery entities when
+     * the firmware was built with WM_BATTERY_MONITORING=1 and the
+     * genPowerCfg cluster is actually present on the device. */
+    exposes: (device, options) => {
+        if (device && hasBatteryCluster(device)) {
+            return [...baseExposes, e.battery(), e.battery_voltage()];
+        }
+        return baseExposes;
+    },
     endpoint: (device) => METER_ENDPOINTS,
     meta: { multiEndpoint: true },
     configure: async (device, coordinatorEndpoint, logger) => {
@@ -93,11 +115,19 @@ const definition = {
             }]);
         }
 
-        /* Battery cluster lives on the first endpoint only. */
-        const battEp = device.getEndpoint(BATTERY_ENDPOINT);
-        await reporting.bind(battEp, coordinatorEndpoint, ['genPowerCfg']);
-        await reporting.batteryPercentageRemaining(battEp);
-        await reporting.batteryVoltage(battEp);
+        /* Battery cluster lives on the first endpoint only, and only
+         * when the firmware is built with WM_BATTERY_MONITORING=1.
+         * Inspect the device's interview data to skip the bind +
+         * configureReporting calls entirely when the cluster isn't
+         * present - that avoids the 10 s timeout per call. */
+        if (hasBatteryCluster(device)) {
+            const battEp = device.getEndpoint(BATTERY_ENDPOINT);
+            await reporting.bind(battEp, coordinatorEndpoint, ['genPowerCfg']);
+            await reporting.batteryPercentageRemaining(battEp);
+            await reporting.batteryVoltage(battEp);
+        } else if (logger && logger.info) {
+            logger.info('[water_meter] genPowerCfg cluster not advertised by device; skipping battery reporting (firmware built without WM_BATTERY_MONITORING).');
+        }
     },
 };
 

@@ -27,8 +27,9 @@ on the build command line.
 ```
 
 ```bash
-idf.py build
-idf.py -p COM4 flash monitor
+idf.py fullclean
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.battery" build
+idf.py -p COM4 build erase-flash flash monitor
 ```
 
 Behavior: always-on Zigbee Router, ~80 mA continuous, full mesh

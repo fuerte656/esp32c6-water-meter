@@ -27,7 +27,7 @@
  *   WM_POWER_USB = 0  -> battery powered, runs as Zigbee End Device.
  *                       See WM_DEEP_SLEEP below for sleep behaviour.
  */
-#define WM_POWER_USB             0
+#define WM_POWER_USB             1
 
 /* =================================================================
  * Deep sleep (only used when WM_POWER_USB = 0)

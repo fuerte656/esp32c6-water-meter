@@ -82,15 +82,14 @@ static esp_zb_cluster_list_t *create_clusters(int idx)
         .power_source = WM_POWER_USB ? 0x01 : 0x03,  /* mains vs battery */
     };
     esp_zb_attribute_list_t *basic = esp_zb_basic_cluster_create(&basic_cfg);
-    /* The stack pre-populates ManufacturerName / ModelIdentifier with
-     * "ESPRESSIF" / "esp32c6" defaults. _add_attr silently fails when
-     * the attribute already exists, so we must use update_attr to
-     * actually override them. */
-    esp_err_t mr = esp_zb_cluster_update_attr(basic,
+    /* On this esp-zigbee version Manufacturer/Model are NOT
+     * pre-populated by esp_zb_basic_cluster_create(), so add_attr
+     * actually inserts them. */
+    esp_err_t mr = esp_zb_basic_cluster_add_attr(basic,
         ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, s_manuf);
-    esp_err_t dr = esp_zb_cluster_update_attr(basic,
+    esp_err_t dr = esp_zb_basic_cluster_add_attr(basic,
         ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, s_model);
-    ESP_LOGI(TAG, "manuf override: %s, model override: %s",
+    ESP_LOGI(TAG, "manuf add: %s, model add: %s",
              esp_err_to_name(mr), esp_err_to_name(dr));
     esp_zb_cluster_list_add_basic_cluster(cluster_list, basic,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
