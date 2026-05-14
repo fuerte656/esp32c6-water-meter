@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_sleep.h"
+#include "driver/gpio.h"
 
 #include "wm_config.h"
 #include "pulse_counter.h"
@@ -27,6 +28,22 @@
 #endif
 
 static const char *TAG = "wm_main";
+
+/* Drive the on-module RF switch: 0 = internal antenna, 1 = external. */
+static void antenna_select(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = BIT64(WM_ANTENNA_CTRL_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    gpio_set_level(WM_ANTENNA_CTRL_GPIO, WM_ANTENNA_EXTERNAL ? 1 : 0);
+    ESP_LOGI(TAG, "Antenna: %s",
+             WM_ANTENNA_EXTERNAL ? "external" : "internal");
+}
 
 /* =====================================================================
  * USB / always-on supervisor task
@@ -212,6 +229,8 @@ void app_main(void)
              WM_POWER_USB ? "USB/Router" : "Battery/EndDevice",
              WM_USE_DEEP_SLEEP ? "deep-sleep" : "always-on",
              WM_BATTERY_MONITORING ? ", battery-mon" : "");
+
+    antenna_select();
 
     ESP_ERROR_CHECK(storage_init());
 

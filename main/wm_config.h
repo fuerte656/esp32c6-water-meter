@@ -71,6 +71,26 @@
 #define WM_KEEPALIVE_PERIOD_S    3600    /* 1 hour */
 
 /* =================================================================
+ * Antenna selection
+ * =================================================================
+ *
+ *   WM_ANTENNA_EXTERNAL = 0 -> use the on-module PCB/chip antenna
+ *                              (default, no extra hardware needed).
+ *
+ *   WM_ANTENNA_EXTERNAL = 1 -> use the external U.FL/IPEX antenna
+ *                              via the on-board RF switch.
+ *
+ * Drives the RF-switch control pin on the module. On ESP32-C6 modules
+ * with a built-in antenna switch (e.g. ESP32-C6-WROOM-1 with U.FL),
+ * the switch is controlled by a single GPIO: low = internal,
+ * high = external. Adjust WM_ANTENNA_CTRL_GPIO to match your board.
+ */
+#define WM_ANTENNA_EXTERNAL      0
+
+/* GPIO that drives the on-module RF switch. */
+#define WM_ANTENNA_CTRL_GPIO     14
+
+/* =================================================================
  * Pulse counting
  * =================================================================
  */
