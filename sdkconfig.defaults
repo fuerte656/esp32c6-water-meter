@@ -26,9 +26,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 
 # ---- Zigbee ------------------------------------------------------
 # Match exactly what the Espressif Zigbee router examples use.
-# Don't disable WiFi/BT/COEX manually - those interact with internal
+# Don't disable WiFi or COEX manually - they interact with internal
 # RF power management on C6 and disabling COEX has been observed to
-# break IEEE 802.15.4 transmission on some IDF versions.
+# break IEEE 802.15.4 transmission on some IDF versions. BT is off
+# by IDF default and stays off.
 CONFIG_ZB_ENABLED=y
 CONFIG_ZB_ZCZR=y
 CONFIG_ZB_RADIO_NATIVE=y

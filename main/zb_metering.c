@@ -412,6 +412,12 @@ static void zb_task(void *arg)
 
     esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+
+    /* Drive the Node Descriptor's "mains powered" bit explicitly. Z2M's
+     * device "Power" field comes from here, not from the Basic cluster's
+     * PowerSource attribute. Must be called after esp_zb_start(). */
+    esp_zb_set_node_descriptor_power_source(WM_POWER_USB ? true : false);
+
     esp_zb_stack_main_loop();
 }
 

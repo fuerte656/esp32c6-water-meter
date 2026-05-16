@@ -3,3 +3,4 @@ managed_components/
 .vscode/
 .cache/
 deploy_converter.ps1
+sdkconfig
