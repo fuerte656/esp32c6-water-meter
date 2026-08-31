@@ -26,13 +26,16 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 
 # ---- Zigbee ------------------------------------------------------
 # Match exactly what the Espressif Zigbee router examples use.
-# Don't disable WiFi or COEX manually - they interact with internal
-# RF power management on C6 and disabling COEX has been observed to
-# break IEEE 802.15.4 transmission on some IDF versions. BT is off
-# by IDF default and stays off.
+# NOTE: historically disabling WiFi/COEX on C6 has been observed to
+# break IEEE 802.15.4 TX on some IDF versions. If Zigbee TX
+# regresses, re-enable WiFi (remove CONFIG_ESP_WIFI_ENABLED=n) and
+# leave COEX at its default before further debugging.
 CONFIG_ZB_ENABLED=y
 CONFIG_ZB_ZCZR=y
 CONFIG_ZB_RADIO_NATIVE=y
+
+# Radios off — Zigbee-only build (BT was already IDF default off)
+CONFIG_BT_ENABLED=n
 
 # Use mbedtls for security (matches the examples)
 CONFIG_MBEDTLS_HARDWARE_AES=y
@@ -43,7 +46,7 @@ CONFIG_IEEE802154_ENABLED=y
 
 # PHY init data in partition (required for IEEE 802.15.4)
 CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION=y
-
+    
 # Full newlib formatting so %llu works in log messages
 # CONFIG_NEWLIB_NANO_FORMAT is not set
 

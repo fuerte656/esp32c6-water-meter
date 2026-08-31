@@ -4,6 +4,7 @@ idf_component_register(
         "pulse_counter.c"
         "storage.c"
         "zb_metering.c"
+        "leak_sensor.c"
         "battery.c"
     INCLUDE_DIRS
         "."

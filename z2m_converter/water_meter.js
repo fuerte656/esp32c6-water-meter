@@ -6,7 +6,11 @@ const ea = exposes.access;
 const e = exposes.presets;
 
 const METER_ENDPOINTS = { meter1: 10, meter2: 11 };
+const LEAK_ENDPOINT = 12;
+const ENDPOINTS = { ...METER_ENDPOINTS, leak: LEAK_ENDPOINT };
 const BATTERY_ENDPOINT = METER_ENDPOINTS.meter1;
+/* Must match WM_LEAK_ZONE_ID in main/wm_config.h. */
+const LEAK_ZONE_ID = 0x2a;
 
 function readUint48(raw) {
     if (raw === null || raw === undefined) return 0;
@@ -45,6 +49,25 @@ const fzWaterSummation = {
     },
 };
 
+/* The firmware publishes leak state as an IAS Zone Status Change
+ * Notification, but a plain zoneStatus read/report is also accepted so
+ * the state can be recovered after a Z2M restart. Bit 0 = Alarm1. */
+const fzWaterLeak = {
+    cluster: 'ssIasZone',
+    type: ['commandStatusChangeNotification', 'attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const raw = msg.type === 'commandStatusChangeNotification'
+            ? msg.data.zonestatus
+            : msg.data.zoneStatus;
+        if (raw === undefined || raw === null) return {};
+        return {
+            water_leak: (raw & 1) > 0,
+            tamper: (raw & (1 << 2)) > 0,
+            battery_low: (raw & (1 << 3)) > 0,
+        };
+    },
+};
+
 const tzWaterRead = {
     key: ['water_consumed', 'water_consumed_liters'],
     convertGet: async (entity, key, meta) => {
@@ -61,6 +84,16 @@ function hasBatteryCluster(device) {
     /* Fallback for older zigbee-herdsman versions: inspect raw list. */
     const ids = (ep.inputClusters || []).map((c) => (typeof c === 'object' ? c.ID : c));
     return ids.includes(1); /* genPowerCfg = 0x0001 */
+}
+
+function hasLeakCluster(device) {
+    const ep = device && device.getEndpoint(LEAK_ENDPOINT);
+    if (!ep) return false;
+    if (typeof ep.supportsInputCluster === 'function') {
+        return ep.supportsInputCluster('ssIasZone');
+    }
+    const ids = (ep.inputClusters || []).map((c) => (typeof c === 'object' ? c.ID : c));
+    return ids.includes(0x500); /* ssIasZone */
 }
 
 const baseExposes = [
@@ -82,6 +115,11 @@ const baseExposes = [
         .withDescription('Total water consumed in liters (meter 2)'),
 ];
 
+/* The leak entities are NOT endpoint-suffixed: the firmware only has
+ * one probe, so plain `water_leak` is what HA's moisture device class
+ * expects. */
+const leakExposes = [e.water_leak(), e.tamper(), e.battery_low()];
+
 const definition = {
     fingerprint: [
         { modelID: 'ESP32C6.WaterMeter', manufacturerName: 'DIY' },
@@ -89,21 +127,52 @@ const definition = {
     zigbeeModel: ['ESP32C6.WaterMeter'],
     model: 'ESP32C6_WATER',
     vendor: 'DIY',
-    description: 'ESP32-C6 Zigbee impulse water meter (dual)',
-    fromZigbee: [fzWaterSummation, fz.battery],
+    description: 'ESP32-C6 Zigbee impulse water meter (dual) with leak probe',
+    fromZigbee: [fzWaterSummation, fzWaterLeak, fz.battery],
     toZigbee: [tzWaterRead],
-    /* Exposes is a function so we only advertise battery entities when
-     * the firmware was built with WM_BATTERY_MONITORING=1 and the
-     * genPowerCfg cluster is actually present on the device. */
+    /* Exposes is a function so we only advertise entities the firmware
+     * actually built: battery needs WM_BATTERY_MONITORING=1, leak needs
+     * WM_LEAK_SENSOR=1. Both are detected from the clusters the device
+     * advertised during the interview. */
     exposes: (device, options) => {
-        if (device && hasBatteryCluster(device)) {
-            return [...baseExposes, e.battery(), e.battery_voltage()];
+        let list = baseExposes;
+        if (device && hasLeakCluster(device)) {
+            list = [...list, ...leakExposes];
         }
-        return baseExposes;
+        if (device && hasBatteryCluster(device)) {
+            list = [...list, e.battery(), e.battery_voltage()];
+        }
+        return list;
     },
-    endpoint: (device) => METER_ENDPOINTS,
+    endpoint: (device) => ENDPOINTS,
     meta: { multiEndpoint: true },
     configure: async (device, coordinatorEndpoint, logger) => {
+        /* Force the displayed power source and device type. Z2M caches
+         * device.type from the initial association and never refreshes
+         * it, so a device that originally joined while the firmware was
+         * misconfigured as ED will be stuck as EndDevice forever. We
+         * pick the source-of-truth from the genPowerCfg cluster:
+         * present  => battery build (WM_BATTERY_MONITORING=1)
+         * absent   => USB/mains build. */
+        const battery = hasBatteryCluster(device);
+        const desiredPower = battery ? 'Battery' : 'Mains (single phase)';
+        const desiredType  = battery ? 'EndDevice' : 'Router';
+        let changed = false;
+        if (device.powerSource !== desiredPower) {
+            device.powerSource = desiredPower;
+            changed = true;
+        }
+        if (device.type !== desiredType) {
+            device.type = desiredType;
+            changed = true;
+        }
+        if (changed) {
+            device.save();
+            if (logger && logger.info) {
+                logger.info(`[water_meter] forced powerSource=${desiredPower}, type=${desiredType} (battery cluster=${battery})`);
+            }
+        }
+
         for (const epId of Object.values(METER_ENDPOINTS)) {
             const endpoint = device.getEndpoint(epId);
             await reporting.bind(endpoint, coordinatorEndpoint, ['seMetering']);
@@ -113,6 +182,32 @@ const definition = {
                 maximumReportInterval: 3600,
                 reportableChange: 1,
             }]);
+        }
+
+        /* IAS Zone enrollment for the leak endpoint. The device only
+         * sends Zone Status Change Notifications to its CIE, so the
+         * coordinator IEEE has to be written first; the firmware's
+         * stack answers with a Zone Enroll Request, which we ack. The
+         * bind is what lets the notification reach Z2M. */
+        if (hasLeakCluster(device)) {
+            const leakEp = device.getEndpoint(LEAK_ENDPOINT);
+            await reporting.bind(leakEp, coordinatorEndpoint, ['ssIasZone']);
+            await leakEp.write('ssIasZone', {
+                iasCieAddr: coordinatorEndpoint.deviceIeeeAddress,
+            });
+            await leakEp.command('ssIasZone', 'enrollRsp', {
+                enrollrspcode: 0,
+                zoneid: LEAK_ZONE_ID,
+            }, { disableDefaultResponse: true });
+            /* Seed the initial state; the device answers with the
+             * current zoneStatus, which fzWaterLeak turns into
+             * water_leak. */
+            await leakEp.read('ssIasZone', ['zoneState', 'zoneStatus']);
+            if (logger && logger.info) {
+                logger.info(`[water_meter] IAS Zone enrolled on endpoint ${LEAK_ENDPOINT} (zone id ${LEAK_ZONE_ID})`);
+            }
+        } else if (logger && logger.info) {
+            logger.info('[water_meter] ssIasZone cluster not advertised by device; skipping leak sensor setup (firmware built without WM_LEAK_SENSOR).');
         }
 
         /* Battery cluster lives on the first endpoint only, and only

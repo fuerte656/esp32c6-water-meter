@@ -11,6 +11,37 @@ Z2M converter in `z2m_converter/water_meter.js` exposes each meter as
 `water_consumed_meter1` / `water_consumed_meter2` (m³) plus the
 matching `_liters` variants.
 
+It also supports an optional **water leak probe**:
+
+- Leak probe on **GPIO 6** -> GND, Zigbee endpoint **12**
+
+The probe is published through the IAS Zone cluster with
+`ZoneType = Water Sensor (0x002a)`, so Z2M exposes it as a plain
+`water_leak` binary sensor (HA device class *moisture*) with no
+endpoint suffix. Toggle it with `WM_LEAK_SENSOR` in
+`main/wm_config.h`.
+
+## Water leak probe
+
+Two bare wires or a commercial probe pad, nothing else needed:
+
+```
+    probe A ----------- GPIO 6      (internal pull-up = dry)
+    probe B ----------- GND         (water bridges them = wet)
+```
+
+The pin is sampled with a multi-sample debounce over
+`WM_LEAK_DEBOUNCE_MS` (200 ms default) so splashes and condensation
+flicker don't produce alarms. State changes are pushed immediately as
+an IAS Zone Status Change Notification, and the current state is
+re-sent on every `WM_KEEPALIVE_PERIOD_S` heartbeat.
+
+If your probe is a module with a push-pull output that goes **high**
+on water, set `WM_LEAK_ACTIVE_LEVEL 1`. The pin then gets an internal
+pull-down instead - but note that in deep-sleep builds it can no
+longer wake the chip (see Pitfalls), so leaks are only noticed on the
+heartbeat.
+
 ## Operating modes
 
 The firmware can be built in three modes by toggling flags in
@@ -190,6 +221,19 @@ IEEE address). HA discovery republishes automatically.
   sources. On wake, each line is sampled - whichever is still closed
   is credited with one pulse. If both fire simultaneously, both get
   credited.
+- The leak probe joins that same wake-on-low mask, which is why
+  `WM_LEAK_ACTIVE_LEVEL` has to be 0 for instant leak detection on
+  battery: `esp_deep_sleep_enable_gpio_wakeup()` applies one level to
+  the whole mask, and the reed switches already claim wake-on-low.
+- While the probe is **wet** it is dropped from the wake mask.
+  Otherwise the chip would wake the instant it slept, since the pin is
+  already sitting at the wake level. The leak clearing is picked up on
+  the next `WM_KEEPALIVE_PERIOD_S` timer wake instead.
+- IAS Zone needs an enrollment handshake before the device will send
+  Zone Status Change Notifications. The converter's `configure()` does
+  it (write `iasCieAddr` -> `enrollRsp`). If the leak entity stays
+  stuck, re-run *Reconfigure* on the device in Z2M; the firmware logs
+  the enroll response under the `wm_zb` tag.
 - The supervisor forces a Zigbee report on every meter (and the
   battery, if monitored) every `WM_KEEPALIVE_PERIOD_S` (1 hour by
   default), so Home Assistant's availability tracker stays happy

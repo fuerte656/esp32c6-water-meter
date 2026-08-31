@@ -2,7 +2,9 @@
  *
  * Registers one endpoint per physical meter (WM_NUM_METERS), each
  * exposing Basic / Identify / Metering. PowerCfg lives on the first
- * endpoint only because there's a single battery.
+ * endpoint only because there's a single battery. When WM_LEAK_SENSOR
+ * is on, one more endpoint exposes Basic / Identify / IAS Zone with
+ * ZoneType = Water Sensor for the leak probe.
  *
  * Adapts to the WM_POWER_USB / WM_DEEP_SLEEP / WM_BATTERY_MONITORING
  * flags in wm_config.h:
@@ -15,6 +17,14 @@
 
 #include "zb_metering.h"
 #include "wm_config.h"
+
+#include "sdkconfig.h"
+#if WM_ZB_ROLE_ROUTER && !defined(CONFIG_ZB_ZCZR)
+#  error "WM_POWER_USB=1 requires CONFIG_ZB_ZCZR=y (use sdkconfig.defaults only, not the .battery overlay)"
+#endif
+#if WM_ZB_ROLE_ED && !defined(CONFIG_ZB_ZED)
+#  error "WM_POWER_USB=0 requires CONFIG_ZB_ZED=y (apply sdkconfig.defaults.battery overlay)"
+#endif
 
 #include "esp_zigbee_core.h"
 #include "esp_log.h"
@@ -36,6 +46,11 @@ static const uint8_t s_endpoints[WM_NUM_METERS] = {
 static bool s_joined = false;
 
 static esp_zb_uint48_t s_summation[WM_NUM_METERS] = {0};
+
+#if WM_LEAK_SENSOR
+/* Mirror of the IAS Zone ZoneStatus attribute. Bit 0 = Alarm1 = wet. */
+static uint16_t s_zone_status = 0;
+#endif
 
 #if WM_BATTERY_MONITORING
 /* 0xFF = "unknown" per ZCL until the first sample arrives. */
@@ -72,10 +87,9 @@ static void build_zcl_string(char *dest, size_t dest_size, const char *src)
 
 /* ---------- cluster construction --------------------------------------- */
 
-static esp_zb_cluster_list_t *create_clusters(int idx)
+/* Basic + Identify are identical on every endpoint. */
+static void add_basic_identify(esp_zb_cluster_list_t *cluster_list)
 {
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-
     /* Basic cluster */
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
@@ -99,6 +113,13 @@ static esp_zb_cluster_list_t *create_clusters(int idx)
     esp_zb_cluster_list_add_identify_cluster(cluster_list,
         esp_zb_identify_cluster_create(&ident_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
+
+static esp_zb_cluster_list_t *create_clusters(int idx)
+{
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    add_basic_identify(cluster_list);
 
     /* Metering cluster, built manually so currentSummDelivered carries
      * the REPORTING access flag. */
@@ -194,6 +215,32 @@ static esp_zb_cluster_list_t *create_clusters(int idx)
     return cluster_list;
 }
 
+#if WM_LEAK_SENSOR
+/* IAS Zone endpoint for the leak probe. esp_zb_ias_zone_cluster_create()
+ * also installs the stack's internal CIE-address bookkeeping attributes,
+ * so the coordinator's write of iasCieAddr and the enroll handshake are
+ * handled by the stack - we only have to push ZoneStatus. */
+static esp_zb_cluster_list_t *create_leak_clusters(void)
+{
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    add_basic_identify(cluster_list);
+
+    esp_zb_ias_zone_cluster_cfg_t zone_cfg = {
+        .zone_state   = ESP_ZB_ZCL_IAS_ZONE_ZONESTATE_NOT_ENROLLED,
+        .zone_type    = ESP_ZB_ZCL_IAS_ZONE_ZONETYPE_WATER_SENSOR,
+        .zone_status  = 0,
+        .ias_cie_addr = ESP_ZB_ZCL_ZONE_IAS_CIE_ADDR_DEFAULT,
+        .zone_id      = WM_LEAK_ZONE_ID,
+    };
+    esp_zb_cluster_list_add_ias_zone_cluster(cluster_list,
+        esp_zb_ias_zone_cluster_create(&zone_cfg),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    return cluster_list;
+}
+#endif /* WM_LEAK_SENSOR */
+
 static void register_endpoint(void)
 {
     build_zcl_string(s_manuf, sizeof(s_manuf), "DIY");
@@ -215,8 +262,38 @@ static void register_endpoint(void)
         esp_zb_ep_list_add_ep(ep_list, create_clusters(i), ep_cfg);
     }
 
+#if WM_LEAK_SENSOR
+    esp_zb_endpoint_config_t leak_ep_cfg = {
+        .endpoint = WM_ESP_ZB_ENDPOINT_LEAK,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id  = ESP_ZB_HA_IAS_ZONE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, create_leak_clusters(), leak_ep_cfg);
+    ESP_LOGI(TAG, "leak endpoint %d registered (IAS Zone, water sensor)",
+             WM_ESP_ZB_ENDPOINT_LEAK);
+#endif
+
     esp_zb_device_register(ep_list);
 }
+
+#if WM_LEAK_SENSOR
+/* The stack answers the CIE-address write and the enroll handshake on
+ * its own; this handler exists so enrollment is visible in the log when
+ * the leak sensor doesn't show up in Z2M. */
+static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id,
+                                    const void *message)
+{
+    if (cb_id == ESP_ZB_CORE_IAS_ZONE_ENROLL_RESPONSE_VALUE_CB_ID) {
+        const esp_zb_zcl_ias_zone_enroll_response_message_t *m = message;
+        ESP_LOGI(TAG, "IAS Zone enroll response: code %d, zone id %d",
+                 m->response_code, m->zone_id);
+    } else {
+        ESP_LOGD(TAG, "ZCL action 0x%x", cb_id);
+    }
+    return ESP_OK;
+}
+#endif
 
 /* ---------- ZDO signal handler ---------------------------------------- */
 
@@ -372,6 +449,51 @@ void zb_metering_update_battery(uint8_t percent, uint32_t mv)
 #endif
 }
 
+void zb_metering_update_leak(bool leak)
+{
+#if WM_LEAK_SENSOR
+    uint16_t status = leak ? ESP_ZB_ZCL_IAS_ZONE_ZONE_STATUS_ALARM1 : 0;
+    bool changed = (status != s_zone_status);
+    s_zone_status = status;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+
+    esp_zb_zcl_status_t st = esp_zb_zcl_set_attribute_val(
+        WM_ESP_ZB_ENDPOINT_LEAK,
+        ESP_ZB_ZCL_CLUSTER_ID_IAS_ZONE,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_IAS_ZONE_ZONESTATUS_ID,
+        &s_zone_status, false);
+
+    /* The Zone Status Change Notification, not attribute reporting, is
+     * how an IAS Zone server publishes state - so we send one on every
+     * push (change or keepalive) rather than relying on the ZoneStatus
+     * attribute carrying the REPORTING access flag. */
+    if (s_joined) {
+        esp_zb_zcl_ias_zone_status_change_notif_cmd_t notif = {
+            .zcl_basic_cmd = { .src_endpoint = WM_ESP_ZB_ENDPOINT_LEAK },
+            .address_mode  = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
+            .zone_status   = s_zone_status,
+            .extend_status = 0,
+            .zone_id       = WM_LEAK_ZONE_ID,
+            .delay         = 0,       /* quarter-seconds since detection */
+        };
+        esp_zb_zcl_ias_zone_status_change_notif_cmd_req(&notif);
+    }
+    esp_zb_lock_release();
+
+    if (changed) {
+        ESP_LOGW(TAG, "leak %s (zone status 0x%04x, set=0x%x, joined=%d)",
+                 leak ? "DETECTED" : "cleared", s_zone_status, st, s_joined);
+    } else {
+        ESP_LOGI(TAG, "leak state %s (zone status 0x%04x, joined=%d)",
+                 leak ? "WET" : "dry", s_zone_status, s_joined);
+    }
+#else
+    (void)leak;
+#endif
+}
+
 /* ---------- Task / start ---------------------------------------------- */
 
 static void zb_task(void *arg)
@@ -410,7 +532,19 @@ static void zb_task(void *arg)
 
     register_endpoint();
 
-    esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
+#if WM_LEAK_SENSOR
+    esp_zb_core_action_handler_register(zcl_action_handler);
+#endif
+
+    esp_zb_set_primary_network_channel_set(WM_ZB_CHANNEL_MASK ); // or  ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
+
+#if WM_ZB_ROLE_ED
+    /* Register the stack's pm_locks so the chip doesn't drop into light
+     * sleep mid-association during steering. Required whenever the
+     * battery overlay (CONFIG_PM_ENABLE=y + tickless idle) is applied. */
+    esp_zb_sleep_enable(true);
+#endif
+
     ESP_ERROR_CHECK(esp_zb_start(false));
 
     /* Drive the Node Descriptor's "mains powered" bit explicitly. Z2M's
@@ -431,4 +565,21 @@ esp_err_t zb_metering_start(void)
 
     BaseType_t ok = xTaskCreate(zb_task, "zb_main", 8192, NULL, 5, NULL);
     return ok == pdPASS ? ESP_OK : ESP_FAIL;
+}
+
+bool zb_metering_is_joined(void)
+{
+    return s_joined;
+}
+
+bool zb_metering_wait_joined(uint32_t timeout_ms)
+{
+    const TickType_t step = pdMS_TO_TICKS(100);
+    TickType_t waited = 0;
+    TickType_t budget = pdMS_TO_TICKS(timeout_ms);
+    while (!s_joined && waited < budget) {
+        vTaskDelay(step);
+        waited += step;
+    }
+    return s_joined;
 }
